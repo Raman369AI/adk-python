@@ -92,6 +92,20 @@ uv.lock
 docs/_build/
 site/
 
+# Claude Code specific
+CLAUDE.md.bak
+*.claude
+.claude/
+claude_context/
+claude_logs/
+
+# SQLite databases (development only)
+*.db
+*.sqlite
+*.sqlite3
+memory.db
+agent_memory.db
+
 # Misc
 .DS_Store
 Thumbs.db
