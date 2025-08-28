@@ -17,7 +17,9 @@ import tempfile
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
+import aiosqlite
 from google.adk.events.event import Event
+from google.adk.memory.sqlite_memory_service import _prepare_fts_query
 from google.adk.memory.sqlite_memory_service import SqliteMemoryService
 from google.adk.sessions.session import Session
 from google.genai import types
@@ -74,14 +76,29 @@ def sample_session():
 
 @pytest.mark.asyncio
 class TestSqliteMemoryService:
-  """Test suite for SqliteMemoryService."""
+  """Test suite for SqliteMemoryService with FTS5 functionality."""
 
   async def test_init_creates_database(self, temp_db_path):
-    """Test that database is created during initialization."""
+    """Test that database is created during lazy initialization."""
     service = SqliteMemoryService(db_path=temp_db_path)
-    await service._init_db()
+    await service._ensure_initialized()
 
     assert Path(temp_db_path).exists()
+    # Verify both main table and FTS5 virtual table exist
+    async with aiosqlite.connect(temp_db_path) as db:
+      # Check main table
+      cursor = await db.execute(
+          "SELECT name FROM sqlite_master WHERE type='table' AND"
+          " name='memory_entries'"
+      )
+      assert await cursor.fetchone() is not None
+
+      # Check FTS5 virtual table
+      cursor = await db.execute(
+          "SELECT name FROM sqlite_master WHERE type='table' AND"
+          " name='memory_entries_fts'"
+      )
+      assert await cursor.fetchone() is not None
 
   async def test_add_session_to_memory(self, sqlite_service, sample_session):
     """Test adding a session to memory."""
@@ -91,10 +108,10 @@ class TestSqliteMemoryService:
     assert stats['total_entries'] == 2  # Only events with text content
     assert stats['entries_per_app']['test_app'] == 2
 
-  async def test_search_memory_keyword_matching(
+  async def test_search_memory_fts5_matching(
       self, sqlite_service, sample_session
   ):
-    """Test searching memory using keyword matching."""
+    """Test searching memory using FTS5 full-text search."""
     await sqlite_service.add_session_to_memory(sample_session)
 
     # Search for matching keyword
@@ -116,18 +133,46 @@ class TestSqliteMemoryService:
 
     assert len(response.memories) == 0
 
+  async def test_search_memory_empty_query(
+      self, sqlite_service, sample_session
+  ):
+    """Test searching memory with empty query."""
+    await sqlite_service.add_session_to_memory(sample_session)
+
+    # Empty query should return empty results
+    response = await sqlite_service.search_memory(
+        app_name='test_app', user_id='user_456', query=''
+    )
+
+    assert len(response.memories) == 0
+
+    # Whitespace-only query should return empty results
+    response = await sqlite_service.search_memory(
+        app_name='test_app', user_id='user_456', query='   \n\t  '
+    )
+
+    assert len(response.memories) == 0
+
   async def test_search_memory_multiple_keywords(
       self, sqlite_service, sample_session
   ):
-    """Test searching memory with multiple keywords."""
+    """Test searching memory with multiple keywords using FTS5 OR logic."""
     await sqlite_service.add_session_to_memory(sample_session)
 
+    # Search with multiple keywords (FTS5 will use OR logic)
     response = await sqlite_service.search_memory(
         app_name='test_app', user_id='user_456', query='help today'
     )
 
     assert len(response.memories) == 1
     assert response.memories[0].author == 'assistant'
+
+    # Search with keywords that should match both entries
+    response = await sqlite_service.search_memory(
+        app_name='test_app', user_id='user_456', query='hello help'
+    )
+
+    assert len(response.memories) == 2  # Should match both entries
 
   async def test_search_memory_user_isolation(self, sqlite_service):
     """Test that memory search is isolated by user."""
@@ -335,3 +380,59 @@ class TestSqliteMemoryService:
 
     stats = await sqlite_service.get_memory_stats()
     assert stats['total_entries'] == 1  # Only the valid event
+
+  async def test_lazy_initialization(self, sqlite_service):
+    """Test that database is initialized only once using lazy initialization."""
+    # Database should not exist initially
+    assert not sqlite_service._initialized
+
+    # First operation should initialize
+    stats1 = await sqlite_service.get_memory_stats()
+    assert sqlite_service._initialized
+    assert stats1['total_entries'] == 0
+
+    # Subsequent operations should not reinitialize
+    stats2 = await sqlite_service.get_memory_stats()
+    assert stats1 == stats2
+
+  async def test_fts_query_preparation(self):
+    """Test FTS5 query preparation function."""
+    # Test normal text
+    assert _prepare_fts_query('hello world') == '"hello" OR "world"'
+
+    # Test special characters are filtered
+    assert _prepare_fts_query('hello! @world#') == '"hello" OR "world"'
+
+    # Test empty/whitespace input
+    assert _prepare_fts_query('') == ''
+    assert _prepare_fts_query('   ') == ''
+    assert _prepare_fts_query('!!!@#$') == ''
+
+    # Test numbers and alphanumeric
+    assert _prepare_fts_query('test123 abc456') == '"test123" OR "abc456"'
+
+  async def test_database_error_handling(self, temp_db_path):
+    """Test proper error handling for database operations."""
+    service = SqliteMemoryService(db_path=temp_db_path)
+
+    # Test stats with database error (corrupted file)
+    # Create a corrupted database file
+    with open(temp_db_path, 'w') as f:
+      f.write('corrupted database content')
+
+    # Should raise error during initialization
+    with pytest.raises(aiosqlite.Error):
+      await service.get_memory_stats()
+
+    # Test error handling in get_memory_stats after successful initialization
+    service2 = SqliteMemoryService(db_path=temp_db_path + '_good')
+    await service2._ensure_initialized()  # Initialize successfully first
+
+    # Now corrupt the database file after initialization
+    with open(service2._db_path, 'w') as f:
+      f.write('corrupted after init')
+
+    # Should handle error gracefully in get_memory_stats
+    stats = await service2.get_memory_stats()
+    assert 'error' in stats
+    assert stats['total_entries'] == 0
